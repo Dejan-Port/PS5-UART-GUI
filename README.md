@@ -1,3 +1,4 @@
+<img width="1034" height="836" alt="Screenshot from 2026-05-28 17-17-05" src="https://github.com/user-attachments/assets/648564df-3d0a-4d95-833d-c3adaf57b899" />
 # PS5 UART Dijagnostika v2.0
 **Servis Port Sabac** — Alat za citanje i brisanje gresaka sa PS5 konzole putem UART/RS232 interfejsa.
 
