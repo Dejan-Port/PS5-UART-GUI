@@ -13,6 +13,7 @@
 | `install_linux.sh` | Linux automatska instalacija |
 | `install_windows.bat` | Windows automatska instalacija |
 | `requirements.txt` | Python zavisnosti |
+| `SERVISPORT_RP2040_BRIDGE.uf2` | RP2040 Zero Firmware, zahteva MicroPython |
 
 ---
 
