@@ -1120,12 +1120,35 @@ def lookup_code(raw_code, db):
 
 def parse_errlog_line(line):
     line = line.strip()
-    if not line.startswith("OK"): return None
     parts = line.split()
-    if len(parts) < 3: return None
-    code = parts[2].upper()
-    if "FFFFFFFF" in code: return "END"
-    if code == "00000000": return None
+    if not parts:
+        return None
+
+    if line.startswith("NG") and len(parts) >= 2:
+        code = parts[1].split(':')[0].upper()
+        # E0000xxx su EMC protokolski status kodovi, ne greske konzole
+        if code and not code.startswith("E0000") and code != "00000000":
+            try:
+                int(code, 16)
+                return code
+            except ValueError:
+                pass
+        return None
+
+    if not line.startswith("OK"):
+        return None
+    if len(parts) < 2:
+        return None
+    status = parts[1].split(':')[0].upper()
+    if "FFFFFFFF" in status:
+        return "END"
+    if len(parts) < 3:
+        return None
+    code = parts[2].split(':')[0].upper()
+    if "FFFFFFFF" in code:
+        return "END"
+    if not code or code == "00000000":
+        return None
     try:
         int(code, 16)
         return code
@@ -1534,18 +1557,34 @@ class PS5UartApp:
             self._log(tr("log_emc_active", self.lang))
         code = parse_errlog_line(line)
         if code and code != "END":
-            self._add_code_to_list(code)
+            self.root.after(0, self._add_code_to_list, code)
+            return
+        # skenira sve tokene u liniji — PS5 moze da izbaci kod u bilo kom formatu
+        skip = {"00000000", "FFFFFFFF", "DEADBEEF"}
+        seen = set()
+        for token in re.findall(r'\b([0-9A-Fa-f]{8})\b', line_up):
+            if token in skip or token.startswith("E0000") or token in seen:
+                continue
+            seen.add(token)
+            if token in self.db:
+                self.root.after(0, self._add_code_to_list, token)
 
     def _active_wake(self):
-        for attempt in range(5):
-            time.sleep(2)
-            if not self.monitoring or self.emc_ready: break
+        probe = "errlog 0"
+        probe_wire = f"{probe}:{self._csum(probe):02X}\n".encode("ascii")
+        for attempt in range(20):
+            if not self.monitoring or self.emc_ready:
+                return
+            time.sleep(1)
+            if not self.monitoring or self.emc_ready:
+                return
             self._send_raw(b"\x05")
-            self._log(tr("log_wake", self.lang, n=attempt+1))
-        time.sleep(2)
-        if self.monitoring and not self.emc_ready:
-            self._send_raw(b"\r\n")
-            self._log(tr("log_wake_enter", self.lang))
+            if attempt % 2 == 0:
+                time.sleep(0.1)
+                self._send_raw(probe_wire)
+                self._log(f"[WAKE] probe errlog 0 (pokusaj {attempt + 1})\n")
+            else:
+                self._log(tr("log_wake", self.lang, n=attempt + 1))
 
     def _emc_status(self, ready):
         self.emc_ready = ready
@@ -1563,12 +1602,19 @@ class PS5UartApp:
             try: self.serial_conn.write(data)
             except: pass
 
+    @staticmethod
+    def _csum(cmd):
+        return sum(ord(c) for c in cmd) % 256
+
     def _send_cmd(self, cmd):
         if not self.serial_conn or not self.serial_conn.is_open:
             self._status("Nije povezano.")
             return
-        self._send_raw((cmd.strip() + "\r\n").encode("ascii"))
-        self._log(f"[TX] {cmd}\n")
+        cmd = cmd.strip()
+        csum = self._csum(cmd)
+        wire = f"{cmd}:{csum:02X}\n"
+        self._send_raw(wire.encode("ascii"))
+        self._log(f"[TX] {wire.strip()}\n")
 
     def _on_send_cmd(self):
         cmd = self.cmd_var.get().strip()
@@ -1587,11 +1633,25 @@ class PS5UartApp:
         threading.Thread(target=self._read_codes_thread, daemon=True).start()
 
     def _read_codes_thread(self):
+        RETRY_CODES = {"E0000001", "E0000002", "E0000003", "E0000004"}
         idx = 0
         found_any = False
         while idx < 32:
-            self._send_cmd(f"errlog {idx}")
-            response = self._wait_response(timeout=3.0)
+            cmd = f"errlog {idx}"
+            retries = 0
+            response = None
+            while retries < 5:
+                self._send_cmd(cmd)
+                response = self._wait_response(timeout=3.0)
+                if response is None:
+                    break
+                raw_code = response.split()[1].split(':')[0].upper() if response.startswith("NG") and len(response.split()) >= 2 else ""
+                if response.startswith("NG") and raw_code in RETRY_CODES:
+                    retries += 1
+                    self.root.after(0, self._log, f"[RETRY {retries}/5] {raw_code} -> pokusavam ponovo...\n")
+                    time.sleep(1.5)
+                    continue
+                break
             if response is None:
                 self.root.after(0, self._log, tr("log_timeout", self.lang, n=idx))
                 break
