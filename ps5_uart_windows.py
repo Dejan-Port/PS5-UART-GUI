@@ -1166,6 +1166,7 @@ def log_to_file(code, desc):
 class PS5UartApp:
     def __init__(self, root):
         self.root = root
+        self.lang = load_lang()
         self.root.title(tr("app_title", self.lang) + " – Servis Port")
         self.root.geometry("1100x800")
         self.root.minsize(1000, 750)
@@ -1178,7 +1179,6 @@ class PS5UartApp:
         except Exception:
             pass
 
-        self.lang = load_lang()
         ensure_dirs()
         self.db = load_local_db()
         self.serial_conn = None
