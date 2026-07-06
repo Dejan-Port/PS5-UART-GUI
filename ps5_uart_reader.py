@@ -1145,6 +1145,7 @@ class PS5UartApp(Gtk.Window):
         self.serial_conn = None
         self.monitoring = False
         self.emc_ready = False
+        self.bridge_mode = False   # True kad je RP2040 bridge konektovan
         self.read_thread = None
         self.found_codes = []
         self._resp_queue = []
@@ -1420,6 +1421,7 @@ class PS5UartApp(Gtk.Window):
         # Opis
         cell_desc = Gtk.CellRendererText()
         cell_desc.set_property("ellipsize", Pango.EllipsizeMode.END)
+        cell_desc.set_property("foreground", "#dde3ef")
         col_desc = Gtk.TreeViewColumn(tr("col_desc", self.lang), cell_desc, text=2)
         col_desc.set_expand(True)
         col_desc.set_resizable(True)
@@ -1427,6 +1429,7 @@ class PS5UartApp(Gtk.Window):
 
         # Vreme
         cell_ts = Gtk.CellRendererText()
+        cell_ts.set_property("foreground", "#7f8ea3")
         col_ts = Gtk.TreeViewColumn(tr("col_time", self.lang), cell_ts, text=3)
         col_ts.set_min_width(75)
         tv.append_column(col_ts)
@@ -1556,6 +1559,10 @@ class PS5UartApp(Gtk.Window):
                 target=self._monitor_loop, daemon=True)
             self.read_thread.start()
 
+            # Ping bridge — da li je RP2040 vec konektovan
+            time.sleep(0.3)
+            self._send_raw(b"BRIDGE:PING\n")
+
             # Aktivni wake — posalji Ctrl+E nakon kratke pauze
             # PS5 mozda vec ceka, probamo odmah
             threading.Thread(target=self._active_wake, daemon=True).start()
@@ -1600,6 +1607,12 @@ class PS5UartApp(Gtk.Window):
     def _disconnect(self):
         self.monitoring = False
         self.emc_ready = False
+        if self.bridge_mode:
+            try:
+                self._send_raw(b"BRIDGE:DISCONNECT\n")
+            except Exception:
+                pass
+        self.bridge_mode = False
         if self.serial_conn:
             try:
                 self.serial_conn.close()
@@ -1630,6 +1643,20 @@ class PS5UartApp(Gtk.Window):
                 time.sleep(0.1)
 
     def _on_monitor_line(self, line):
+        # RP2040 bridge poruke
+        if line.startswith("BRIDGE:"):
+            if line == "BRIDGE:READY":
+                if not self.bridge_mode:
+                    self.bridge_mode = True
+                    self._send_raw(b"BRIDGE:PING\n")
+                    self._log_main("[BRIDGE] Servis Port RP2040 Bridge detektovan\n")
+                led_txt = " [RP2040]"
+                self.conn_lbl.set_markup('<span foreground="#2ecc71">Povezano{}</span>'.format(led_txt))
+            elif line == "BRIDGE:EMC=1":
+                self._emc_status(True)
+                self._log_main("[BRIDGE] EMC aktivan (javilo bridge)\n")
+            return
+
         self._log_main("[RX] {}\n".format(line))
         line_up = line.upper()
         if any(x in line_up for x in ["UART CMD READY", "CMD READY", "MANU", "[MANU]"]):
@@ -1680,8 +1707,12 @@ class PS5UartApp(Gtk.Window):
             self._status(tr("err_no_port", self.lang))
             return
         cmd = cmd.strip()
-        csum = sum(ord(c) for c in cmd) % 256
-        wire = "{:s}:{:02X}\n".format(cmd, csum)
+        if self.bridge_mode:
+            # RP2040 bridge sam dodaje checksum
+            wire = cmd + "\n"
+        else:
+            csum = sum(ord(c) for c in cmd) % 256
+            wire = "{:s}:{:02X}\n".format(cmd, csum)
         self._send_raw(wire.encode("ascii"))
         self._log_main("[TX] {}\n".format(wire.strip()))
 
@@ -1760,6 +1791,7 @@ class PS5UartApp(Gtk.Window):
             transient_for=self, flags=0)
         dlg.add_buttons(tr("dlg_yes", self.lang), Gtk.ResponseType.YES,
                         tr("dlg_no", self.lang), Gtk.ResponseType.NO)
+        dlg.override_background_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.102, 0.102, 0.208, 1))
         box = dlg.get_content_area()
         box.set_spacing(8)
         box.set_margin_start(20)
@@ -1767,16 +1799,13 @@ class PS5UartApp(Gtk.Window):
         box.set_margin_top(16)
         box.set_margin_bottom(16)
         title_lbl = Gtk.Label()
-        title_lbl.set_markup("<b>Obrisi greske sa PS5?</b>")
+        title_lbl.set_markup('<span foreground="#e94560"><b>{}</b></span>'.format(
+            tr("dlg_clear_title", self.lang)))
         title_lbl.set_halign(Gtk.Align.START)
-        title_lbl.override_color(Gtk.StateFlags.NORMAL,
-            Gdk.RGBA(0, 0, 0, 1))
-        body_lbl = Gtk.Label(
-            label=tr("dlg_clear_body", self.lang))
+        body_lbl = Gtk.Label(label=tr("dlg_clear_body", self.lang))
         body_lbl.set_halign(Gtk.Align.START)
         body_lbl.set_line_wrap(True)
-        body_lbl.override_color(Gtk.StateFlags.NORMAL,
-            Gdk.RGBA(0, 0, 0, 1))
+        body_lbl.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(0.867, 0.890, 0.937, 1))
         box.pack_start(title_lbl, False, False, 0)
         box.pack_start(body_lbl, False, False, 0)
         dlg.show_all()

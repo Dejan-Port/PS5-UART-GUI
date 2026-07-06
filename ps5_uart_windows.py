@@ -1126,8 +1126,8 @@ def parse_errlog_line(line):
 
     if line.startswith("NG") and len(parts) >= 2:
         code = parts[1].split(':')[0].upper()
-        # E0000xxx su EMC protokolski status kodovi, ne greske konzole
-        if code and not code.startswith("E0000") and code != "00000000":
+        # E0000xxx i F0000xxx su EMC protokolski status kodovi, ne greske konzole
+        if code and not code.startswith("E0000") and not code.startswith("F0000") and code != "00000000":
             try:
                 int(code, 16)
                 return code
@@ -1184,6 +1184,7 @@ class PS5UartApp:
         self.serial_conn = None
         self.monitoring  = False
         self.emc_ready   = False
+        self.bridge_mode = False
         self.read_thread = None
         self.found_codes = []
         self._resp_queue = []
@@ -1467,7 +1468,9 @@ class PS5UartApp:
         values = []
         for p in ports:
             desc = p.description or ""
-            label = f"{p.device} – {desc[:35]}" if desc and desc != "n/a" else p.device
+            if getattr(p, "vid", None) == 0x2E8A or "Servis Port" in desc or "RP2040" in desc:
+                desc = "Servis Port RP2040 Bridge"
+            label = f"{p.device} – {desc[:40]}" if desc and desc != "n/a" else p.device
             values.append(label)
         if values:
             self.port_combo["values"] = values
@@ -1509,14 +1512,23 @@ class PS5UartApp:
             self._log(tr("log_connected", self.lang, port=port, baud=baud))
             self.read_thread = threading.Thread(target=self._monitor_loop, daemon=True)
             self.read_thread.start()
+            self.root.after(300, self._bridge_ping_once)
             threading.Thread(target=self._active_wake, daemon=True).start()
         except serial.SerialException as e:
             messagebox.showerror("Greska", str(e))
             self._status(f"Greska: {e}")
 
+    def _bridge_ping_once(self):
+        if self.serial_conn and self.serial_conn.is_open:
+            self._send_raw(b"BRIDGE:PING\n")
+
     def _disconnect(self):
         self.monitoring = False
         self.emc_ready  = False
+        if self.bridge_mode and self.serial_conn and self.serial_conn.is_open:
+            try: self.serial_conn.write(b"BRIDGE:DISCONNECT\n")
+            except: pass
+        self.bridge_mode = False
         if self.serial_conn:
             try: self.serial_conn.close()
             except: pass
@@ -1545,6 +1557,19 @@ class PS5UartApp:
                 time.sleep(0.1)
 
     def _on_monitor_line(self, line):
+        # ── BRIDGE protokol ───────────────────────────────────────────────────
+        if line.startswith("BRIDGE:"):
+            if line == "BRIDGE:READY":
+                if not self.bridge_mode:
+                    self.bridge_mode = True
+                    self._send_raw(b"BRIDGE:PING\n")
+                    self._log("[BRIDGE] Servis Port RP2040 Bridge detektovan\n")
+            elif line == "BRIDGE:EMC=1":
+                if not self.emc_ready:
+                    self._emc_status(True)
+                    self._log(tr("log_emc_active", self.lang))
+            return
+
         self._log(f"[RX] {line}\n")
         line_up = line.upper()
         if any(x in line_up for x in ["UART CMD READY", "CMD READY", "MANU"]):
@@ -1573,10 +1598,10 @@ class PS5UartApp:
         probe = "errlog 0"
         probe_wire = f"{probe}:{self._csum(probe):02X}\n".encode("ascii")
         for attempt in range(20):
-            if not self.monitoring or self.emc_ready:
+            if not self.monitoring or self.emc_ready or self.bridge_mode:
                 return
             time.sleep(1)
-            if not self.monitoring or self.emc_ready:
+            if not self.monitoring or self.emc_ready or self.bridge_mode:
                 return
             self._send_raw(b"\x05")
             if attempt % 2 == 0:
@@ -1679,13 +1704,47 @@ class PS5UartApp:
             time.sleep(0.05)
         return None
 
+    def _confirm_dialog(self, title, body, yes_text, no_text):
+        result = [False]
+        dlg = tk.Toplevel(self.root)
+        dlg.title("")
+        dlg.configure(bg=BG2)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+        dlg.update_idletasks()
+        px = self.root.winfo_x() + self.root.winfo_width() // 2
+        py = self.root.winfo_y() + self.root.winfo_height() // 2
+        dlg.geometry(f"420x210+{px-210}+{py-105}")
+        tk.Label(dlg, text=title, bg=BG2, fg=RED,
+                 font=("Segoe UI", 12, "bold"), wraplength=380).pack(padx=20, pady=(18, 4))
+        tk.Label(dlg, text=body, bg=BG2, fg=FG,
+                 font=("Segoe UI", 9), justify="left", wraplength=380).pack(padx=20, pady=(4, 14))
+        bf = tk.Frame(dlg, bg=BG2)
+        bf.pack(pady=(0, 18))
+        def _yes():
+            result[0] = True
+            dlg.destroy()
+        def _no():
+            dlg.destroy()
+        tk.Button(bf, text=yes_text, command=_yes,
+                  bg=BTN_DEL, fg="white", activebackground="#e94560", activeforeground="white",
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(side="left", padx=8)
+        tk.Button(bf, text=no_text, command=_no,
+                  bg=BTN_SEC, fg=FG, activebackground="#2a4f7f", activeforeground=FG,
+                  relief="flat", padx=16, pady=6, cursor="hand2").pack(side="left", padx=8)
+        dlg.bind("<Return>", lambda e: _yes())
+        dlg.bind("<Escape>", lambda e: _no())
+        dlg.protocol("WM_DELETE_WINDOW", _no)
+        self.root.wait_window(dlg)
+        return result[0]
+
     def _on_clear_ps5(self):
-        if not messagebox.askyesno(
-            "Obrisi greske sa PS5",
-            "Salje se 'errlog clear' komanda PS5 konzoli.\n"
-            "Svi zapisi na konzoli bice trajno obrisani.\n\n"
-            "Preporucuje se da prvo sacuvas kodove.\n\n"
-            "Da li zelite da nastavite?"):
+        if not self._confirm_dialog(
+            tr("dlg_clear_title", self.lang),
+            tr("dlg_clear_body", self.lang),
+            tr("dlg_yes", self.lang),
+            tr("dlg_no", self.lang)):
             return
         self.btn_clear_ps5.config(state="disabled")
         self._log(tr("log_clearing", self.lang))
